@@ -1,7 +1,7 @@
-import React, { useEffect, useMemo, useState, useRef } from "react";
+import React, { useEffect, useMemo, useState, useRef, useCallback } from "react";
 import {
   LineChart, Line, XAxis, YAxis, Tooltip, CartesianGrid, ResponsiveContainer,
-  AreaChart, Area, BarChart, Bar
+  AreaChart, Area, BarChart, Bar, ComposedChart, ReferenceLine
 } from "recharts";
 
 // ==================== REAL MARKET SIMULATION ENGINE ====================
@@ -69,16 +69,17 @@ const MARKET_EVENTS = {
 };
 
 // Utility functions
-const fmtCurrency = (n) => `$${n.toFixed(2)}`;
+const fmtCurrency = (n) => `$${n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 const fmtPercent = (n) => `${(n * 100).toFixed(2)}%`;
+const fmtNumber = (n) => n.toLocaleString();
 const now = () => Date.now();
 const randomInt = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
 const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
 
-// Realistic price generator using Geometric Brownian Motion
-function generateRealisticPrice(previousPrice, volatility, marketSentiment, eventImpact = 0) {
+// Realistic price generator using Geometric Brownian Motion with market microstructure
+function generateRealisticPrice(previousPrice, volatility, marketSentiment, eventImpact = 0, timeStep = 1/252/390) {
   const drift = 0.0001 + (marketSentiment * 0.0003); // Base drift + sentiment influence
-  const volatilityFactor = volatility * Math.sqrt(1/252); // Daily volatility
+  const volatilityFactor = volatility * Math.sqrt(timeStep); // Adjusted volatility
   const randomShock = (Math.random() - 0.5) * 2; // Random shock between -1 and 1
   
   // Combine all factors
@@ -96,7 +97,7 @@ const MarketTooltip = ({ active, payload, label }) => {
         <p className="text-gray-300 text-sm">{new Date(label).toLocaleString()}</p>
         <p className="text-blue-400 font-bold text-lg">{fmtCurrency(payload[0].value)}</p>
         {payload[0].payload.volume && (
-          <p className="text-gray-400 text-sm">Volume: {payload[0].payload.volume.toLocaleString()}</p>
+          <p className="text-gray-400 text-sm">Volume: {fmtNumber(payload[0].payload.volume)}</p>
         )}
       </div>
     );
@@ -111,19 +112,39 @@ export default function ProfessionalTradingSimulator() {
   const [marketData, setMarketData] = useState(() => {
     const allAssets = [...MARKET_SYMBOLS.STOCKS, ...MARKET_SYMBOLS.CRYPTO];
     return allAssets.reduce((acc, asset) => {
+      // Generate 30 days of historical data for proper charting
+      const initialHistory = [];
+      const days = 30;
+      const pointsPerDay = 390; // Trading minutes
+      const totalPoints = days * pointsPerDay;
+      
+      let currentPrice = asset.basePrice;
+      for (let i = 0; i < totalPoints; i++) {
+        // Generate realistic historical price
+        const timeStep = 1/252/pointsPerDay;
+        const randomShock = (Math.random() - 0.5) * 2;
+        const priceChange = 0.0001 + asset.volatility * Math.sqrt(timeStep) * randomShock;
+        currentPrice = currentPrice * Math.exp(priceChange);
+        
+        initialHistory.push({
+          price: currentPrice,
+          volume: randomInt(100000, 500000),
+          timestamp: now() - (totalPoints - i) * 60000 // 1 minute intervals
+        });
+      }
+      
       acc[asset.symbol] = {
         ...asset,
-        price: asset.basePrice,
-        history: Array(100).fill(0).map((_, i) => ({
-          price: asset.basePrice * (0.95 + Math.random() * 0.1),
-          volume: randomInt(100000, 500000),
-          timestamp: now() - (100 - i) * 60000
-        })),
-        dailyHigh: asset.basePrice,
-        dailyLow: asset.basePrice,
+        price: currentPrice,
+        history: initialHistory,
+        dailyHigh: Math.max(...initialHistory.slice(-390).map(h => h.price)),
+        dailyLow: Math.min(...initialHistory.slice(-390).map(h => h.price)),
         change: 0,
         changePercent: 0,
-        volume: randomInt(100000, 1000000)
+        volume: initialHistory.slice(-390).reduce((sum, h) => sum + h.volume, 0),
+        bid: currentPrice * 0.9995,
+        ask: currentPrice * 1.0005,
+        spread: currentPrice * 0.001
       };
       return acc;
     }, {});
@@ -133,17 +154,22 @@ export default function ProfessionalTradingSimulator() {
     sentiment: 0, // -1 to 1
     events: [],
     isMarketOpen: true,
-    lastUpdate: now()
+    lastUpdate: now(),
+    marketHours: {
+      open: new Date().setHours(9, 30, 0, 0),
+      close: new Date().setHours(16, 0, 0, 0)
+    }
   });
 
   const [portfolio, setPortfolio] = useState({
     cash: 100000,
     positions: {},
-    equityHistory: Array(100).fill(0).map((_, i) => ({
+    equityHistory: Array(390).fill(0).map((_, i) => ({
       value: 100000,
-      timestamp: now() - (100 - i) * 60000
+      timestamp: now() - (390 - i) * 60000
     })),
-    totalValue: 100000
+    totalValue: 100000,
+    realizedPnL: 0
   });
 
   const [tradingState, setTradingState] = useState({
@@ -151,7 +177,9 @@ export default function ProfessionalTradingSimulator() {
     quantity: "",
     activeTab: "chart",
     chartRange: "1D",
-    orderType: "market"
+    orderType: "market",
+    limitPrice: "",
+    stopPrice: ""
   });
 
   const [performanceMetrics, setPerformanceMetrics] = useState({
@@ -164,20 +192,56 @@ export default function ProfessionalTradingSimulator() {
     maxDrawdown: 0
   });
 
+  const [orderBook, setOrderBook] = useState({
+    bids: [],
+    asks: []
+  });
+
+  const [tradeHistory, setTradeHistory] = useState([]);
+
   // Refs for interval management
   const marketIntervalRef = useRef();
   const eventIntervalRef = useRef();
+  const orderBookIntervalRef = useRef();
 
   // Get current asset
   const currentAsset = marketData[tradingState.selectedSymbol];
+
+  // Generate order book data
+  const generateOrderBook = useCallback((price) => {
+    const bids = [];
+    const asks = [];
+    const spread = price * 0.0005; // 0.05% spread
+    
+    // Generate bids (buy orders)
+    for (let i = 1; i <= 15; i++) {
+      const bidPrice = price - (spread * i);
+      bids.push({
+        price: bidPrice,
+        size: randomInt(10, 1000)
+      });
+    }
+    
+    // Generate asks (sell orders)
+    for (let i = 1; i <= 15; i++) {
+      const askPrice = price + (spread * i);
+      asks.push({
+        price: askPrice,
+        size: randomInt(10, 1000)
+      });
+    }
+    
+    return { bids, asks };
+  }, []);
 
   // Market simulation engine
   useEffect(() => {
     // Clear any existing intervals
     if (marketIntervalRef.current) clearInterval(marketIntervalRef.current);
     if (eventIntervalRef.current) clearInterval(eventIntervalRef.current);
+    if (orderBookIntervalRef.current) clearInterval(orderBookIntervalRef.current);
 
-    // Market data updates (every second)
+    // Market data updates (every 500ms for realistic trading)
     marketIntervalRef.current = setInterval(() => {
       setMarketData(prev => {
         const newData = { ...prev };
@@ -194,10 +258,16 @@ export default function ProfessionalTradingSimulator() {
 
           const newPrice = generateRealisticPrice(
             asset.price,
-            asset.volatility,
-            marketStatus.sentiment,
-            eventImpact
+            asset.volatility * 0.7, // Reduced volatility for stability
+            marketStatus.sentiment * 0.5, // Reduced sentiment impact
+            eventImpact * 0.5, // Reduced event impact
+            1/252/390/2 // 500ms intervals
           );
+
+          // Update bid/ask prices
+          const spread = newPrice * 0.0003; // Tighter spread
+          const bid = newPrice - spread;
+          const ask = newPrice + spread;
 
           // Update asset data
           newData[symbol] = {
@@ -207,18 +277,21 @@ export default function ProfessionalTradingSimulator() {
               ...asset.history.slice(1),
               {
                 price: newPrice,
-                volume: randomInt(50000, 2000000),
+                volume: randomInt(5000, 25000),
                 timestamp: now()
               }
             ],
             dailyHigh: Math.max(asset.dailyHigh, newPrice),
             dailyLow: Math.min(asset.dailyLow, newPrice),
-            change: newPrice - asset.history[0]?.price || 0,
-            changePercent: ((newPrice - asset.history[0]?.price) / asset.history[0]?.price) * 100 || 0,
-            volume: randomInt(50000, 2000000)
+            change: newPrice - asset.history[asset.history.length - 390]?.price || 0,
+            changePercent: ((newPrice - asset.history[asset.history.length - 390]?.price) / asset.history[asset.history.length - 390]?.price) * 100 || 0,
+            volume: asset.volume + randomInt(5000, 25000),
+            bid,
+            ask,
+            spread: ask - bid
           };
 
-          totalSentiment += newPrice > asset.price ? 0.1 : -0.1;
+          totalSentiment += newPrice > asset.price ? 0.005 : -0.005;
         });
 
         return newData;
@@ -245,21 +318,21 @@ export default function ProfessionalTradingSimulator() {
       setMarketStatus(prev => ({
         ...prev,
         lastUpdate: now(),
-        sentiment: clamp(prev.sentiment + (Math.random() - 0.5) * 0.1, -1, 1)
+        sentiment: clamp(prev.sentiment + (Math.random() - 0.5) * 0.01, -1, 1)
       }));
 
-    }, 1000);
+    }, 500); // 500ms updates for more stable movement
 
-    // Market events (every 5-10 seconds)
+    // Market events (every 20-40 seconds)
     eventIntervalRef.current = setInterval(() => {
-      if (Math.random() < 0.3) { // 30% chance of event
+      if (Math.random() < 0.2) { // 20% chance of event
         const eventType = Math.random() < 0.6 ? "POSITIVE" : "NEGATIVE";
         const events = MARKET_EVENTS[eventType];
         const eventMessage = events[randomInt(0, events.length - 1)];
         
         const impact = eventType === "POSITIVE" ? 
-          randomInt(1, 5) / 100 : 
-          randomInt(-5, -1) / 100;
+          randomInt(1, 5) / 1000 : 
+          randomInt(-5, -1) / 1000;
 
         // Determine affected symbols
         let affectedSymbols = [];
@@ -284,7 +357,7 @@ export default function ProfessionalTradingSimulator() {
           symbols: affectedSymbols,
           sector,
           timestamp: now(),
-          duration: randomInt(10, 30) // Event lasts 10-30 seconds
+          duration: randomInt(15, 45) // Event lasts 15-45 seconds
         };
 
         setMarketStatus(prev => ({
@@ -300,13 +373,22 @@ export default function ProfessionalTradingSimulator() {
           }));
         }, newEvent.duration * 1000);
       }
-    }, randomInt(5000, 10000));
+    }, randomInt(20000, 40000));
+
+    // Order book updates (every 1000ms)
+    orderBookIntervalRef.current = setInterval(() => {
+      if (currentAsset) {
+        const newOrderBook = generateOrderBook(currentAsset.price);
+        setOrderBook(newOrderBook);
+      }
+    }, 1000);
 
     return () => {
       clearInterval(marketIntervalRef.current);
       clearInterval(eventIntervalRef.current);
+      clearInterval(orderBookIntervalRef.current);
     };
-  }, [marketData]);
+  }, [marketData, currentAsset, generateOrderBook]);
 
   // Trading functions
   const executeTrade = (action) => {
@@ -316,7 +398,18 @@ export default function ProfessionalTradingSimulator() {
     const asset = marketData[tradingState.selectedSymbol];
     if (!asset) return;
 
-    const tradePrice = asset.price;
+    let tradePrice;
+    if (tradingState.orderType === "market") {
+      tradePrice = action === "buy" ? asset.ask : asset.bid;
+    } else if (tradingState.orderType === "limit") {
+      tradePrice = parseFloat(tradingState.limitPrice);
+      if (isNaN(tradePrice)) return;
+    } else {
+      // Stop order
+      tradePrice = parseFloat(tradingState.stopPrice);
+      if (isNaN(tradePrice)) return;
+    }
+
     const tradeValue = tradePrice * quantity;
 
     if (action === 'buy') {
@@ -376,7 +469,8 @@ export default function ProfessionalTradingSimulator() {
         return {
           ...prev,
           cash: prev.cash + tradeValue,
-          positions: newPositions
+          positions: newPositions,
+          realizedPnL: prev.realizedPnL + profit
         };
       });
 
@@ -390,32 +484,50 @@ export default function ProfessionalTradingSimulator() {
       }));
     }
 
+    // Add to trade history
+    setTradeHistory(prev => [
+      {
+        id: Math.random().toString(36).substr(2, 9),
+        symbol: tradingState.selectedSymbol,
+        action,
+        quantity,
+        price: tradePrice,
+        timestamp: now()
+      },
+      ...prev.slice(0, 49) // Keep last 50 trades
+    ]);
+
     setTradingState(prev => ({ ...prev, quantity: "" }));
   };
 
-  // Chart data preparation
+  // Chart data preparation with proper historical data
   const chartData = useMemo(() => {
     if (!currentAsset) return [];
     
-    let dataPoints = currentAsset.history;
+    const dataPoints = [...currentAsset.history];
     const nowTime = now();
+    let filteredData = [];
 
     switch (tradingState.chartRange) {
       case "1D":
-        dataPoints = dataPoints.filter(point => point.timestamp > nowTime - 24 * 60 * 60 * 1000);
+        // Last 390 minutes (trading day)
+        filteredData = dataPoints.filter(point => point.timestamp > nowTime - 24 * 60 * 60 * 1000);
         break;
       case "1W":
-        dataPoints = dataPoints.filter(point => point.timestamp > nowTime - 7 * 24 * 60 * 60 * 1000);
+        // Last 7 days
+        filteredData = dataPoints.filter(point => point.timestamp > nowTime - 7 * 24 * 60 * 60 * 1000);
         break;
       case "1M":
-        dataPoints = dataPoints.filter(point => point.timestamp > nowTime - 30 * 24 * 60 * 60 * 1000);
+        // Last 30 days
+        filteredData = dataPoints.filter(point => point.timestamp > nowTime - 30 * 24 * 60 * 60 * 1000);
         break;
       default:
-        // All data
+        // All data (30 days)
+        filteredData = dataPoints;
         break;
     }
 
-    return dataPoints.map(point => ({
+    return filteredData.map(point => ({
       ...point,
       time: point.timestamp,
       value: point.price
@@ -457,27 +569,50 @@ export default function ProfessionalTradingSimulator() {
     };
   }, [portfolio.equityHistory]);
 
+  // Format timestamp for chart
+  const formatTime = (timestamp) => {
+    const date = new Date(timestamp);
+    switch (tradingState.chartRange) {
+      case "1D":
+        return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+      case "1W":
+      case "1M":
+      case "ALL":
+        return date.toLocaleDateString([], { month: 'short', day: 'numeric' });
+      default:
+        return date.toLocaleDateString();
+    }
+  };
+
   // Render component
   return (
     <div className="min-h-screen bg-gray-900 text-white">
       {/* Header */}
-      <header className="bg-gray-800 border-b border-gray-700 p-4">
+      <header className="bg-gray-800 border-b border-gray-700 p-4 sticky top-0 z-50">
         <div className="max-w-7xl mx-auto flex justify-between items-center">
           <div className="flex items-center space-x-4">
-            <h1 className="text-2xl font-bold text-blue-400">📈 Quantum Trader Pro</h1>
-            <div className={`px-3 py-1 rounded-full text-sm ${
-              marketStatus.sentiment > 0.2 ? "bg-green-500" :
-              marketStatus.sentiment < -0.2 ? "bg-red-500" :
-              "bg-gray-600"
+            <h1 className="text-2xl font-bold text-blue-400 flex items-center">
+              <span className="mr-2">📈</span> Quantum Trader Pro
+            </h1>
+            <div className={`px-3 py-1 rounded-full text-sm font-medium ${
+              marketStatus.sentiment > 0.2 ? "bg-green-500/20 text-green-400" :
+              marketStatus.sentiment < -0.2 ? "bg-red-500/20 text-red-400" :
+              "bg-gray-600/20 text-gray-400"
             }`}>
-              {marketStatus.sentiment > 0.2 ? "🐂 BULL MARKET" : 
-               marketStatus.sentiment < -0.2 ? "🐻 BEAR MARKET" : "🔄 NEUTRAL"}
+              {marketStatus.sentiment > 0.2 ? "牛市" : 
+               marketStatus.sentiment < -0.2 ? "熊市" : "震荡"}
             </div>
           </div>
           
           <div className="text-right">
-            <div className="text-lg">Portfolio Value: <span className="font-bold text-green-400">{fmtCurrency(portfolio.totalValue)}</span></div>
-            <div className="text-sm text-gray-400">Cash: {fmtCurrency(portfolio.cash)} • Last Update: {new Date(marketStatus.lastUpdate).toLocaleTimeString()}</div>
+            <div className="text-lg font-semibold">Portfolio: <span className="text-green-400">{fmtCurrency(portfolio.totalValue)}</span></div>
+            <div className="text-sm text-gray-400 flex items-center justify-end">
+              <span className="mr-4">Cash: {fmtCurrency(portfolio.cash)}</span>
+              <span className="flex items-center">
+                <span className="h-2 w-2 bg-green-500 rounded-full mr-1 animate-pulse"></span>
+                Live
+              </span>
+            </div>
           </div>
         </div>
       </header>
@@ -486,52 +621,68 @@ export default function ProfessionalTradingSimulator() {
         {/* Market Events Ticker */}
         {marketStatus.events.length > 0 && (
           <div className="bg-gray-800 rounded-lg p-3 mb-6 border-l-4 border-yellow-500">
-            <h3 className="font-semibold mb-2">📢 Market News</h3>
-            <div className="space-y-2">
+            <div className="flex items-center mb-2">
+              <h3 className="font-semibold flex items-center">
+                <span className="mr-2">📢</span> Market News
+              </h3>
+            </div>
+            <div className="space-y-2 max-h-32 overflow-y-auto">
               {marketStatus.events.map(event => (
-                <div key={event.id} className={`text-sm p-2 rounded ${
-                  event.type === 'positive' ? 'bg-green-500/20' : 'bg-red-500/20'
+                <div key={event.id} className={`text-sm p-2 rounded flex items-start ${
+                  event.type === 'positive' ? 'bg-green-500/10 border border-green-500/20' : 'bg-red-500/10 border border-red-500/20'
                 }`}>
-                  {event.message} {event.sector && `(${event.sector} Sector)`}
+                  <span className="mr-2">
+                    {event.type === 'positive' ? '📈' : '📉'}
+                  </span>
+                  <span>
+                    {event.message} {event.sector && <span className="text-yellow-400">({event.sector})</span>}
+                  </span>
                 </div>
               ))}
             </div>
           </div>
         )}
 
-        <div className="grid grid-cols-1 lg:grid-cols-4 gap-6">
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
           {/* Left Sidebar - Assets & Trading */}
           <div className="lg:col-span-1 space-y-6">
             {/* Assets List */}
-            <div className="bg-gray-800 rounded-lg p-4">
-              <h2 className="text-lg font-semibold mb-4">📊 Market Watch</h2>
+            <div className="bg-gray-800 rounded-xl p-4 shadow-lg">
+              <div className="flex justify-between items-center mb-4">
+                <h2 className="text-lg font-semibold flex items-center">
+                  <span className="mr-2">📊</span> Market Watch
+                </h2>
+                <div className="text-xs bg-gray-700 px-2 py-1 rounded">
+                  {Object.keys(marketData).length} Assets
+                </div>
+              </div>
               <div className="space-y-2 max-h-96 overflow-y-auto">
                 {Object.values(marketData).map(asset => {
                   const position = portfolio.positions[asset.symbol];
                   return (
                     <div
                       key={asset.symbol}
-                      className={`p-3 rounded cursor-pointer transition-all ${
+                      className={`p-3 rounded-lg cursor-pointer transition-all border ${
                         tradingState.selectedSymbol === asset.symbol 
-                          ? 'bg-blue-600' 
-                          : 'bg-gray-700 hover:bg-gray-600'
+                          ? 'bg-blue-600/20 border-blue-500' 
+                          : 'bg-gray-700/50 border-gray-700 hover:bg-gray-700 hover:border-gray-600'
                       }`}
                       onClick={() => setTradingState(prev => ({ ...prev, selectedSymbol: asset.symbol }))}
                     >
                       <div className="flex justify-between items-center">
                         <div>
                           <div className="font-semibold">{asset.symbol}</div>
-                          <div className="text-xs text-gray-400">{asset.name}</div>
+                          <div className="text-xs text-gray-400 truncate max-w-[120px]">{asset.name}</div>
                         </div>
                         <div className="text-right">
                           <div className="font-bold">{fmtCurrency(asset.price)}</div>
-                          <div className={`text-xs ${
+                          <div className={`text-xs flex items-center justify-end ${
                             asset.changePercent >= 0 ? 'text-green-400' : 'text-red-400'
                           }`}>
-                            {asset.changePercent >= 0 ? '↗' : '↘'} {Math.abs(asset.changePercent).toFixed(2)}%
+                            {asset.changePercent >= 0 ? '▲' : '▼'} {Math.abs(asset.changePercent).toFixed(2)}%
                           </div>
                           {position && (
-                            <div className={`text-xs ${
+                            <div className={`text-xs flex items-center justify-end ${
                               (asset.price - position.averageCost) >= 0 ? 'text-green-300' : 'text-red-300'
                             }`}>
                               P/L: {fmtCurrency((asset.price - position.averageCost) * position.quantity)}
@@ -546,77 +697,144 @@ export default function ProfessionalTradingSimulator() {
             </div>
 
             {/* Trading Panel */}
-            <div className="bg-gray-800 rounded-lg p-4">
-              <h2 className="text-lg font-semibold mb-4">🎯 Trade Execution</h2>
+            <div className="bg-gray-800 rounded-xl p-4 shadow-lg">
+              <h2 className="text-lg font-semibold mb-4 flex items-center">
+                <span className="mr-2">🎯</span> Trade Execution
+              </h2>
               <div className="space-y-4">
-                <div className="bg-gray-700 p-3 rounded">
-                  <div className="flex justify-between items-center">
+                <div className="bg-gray-700/50 p-3 rounded-lg border border-gray-700">
+                  <div className="flex justify-between items-center mb-2">
                     <span className="font-semibold">{tradingState.selectedSymbol}</span>
-                    <span className="text-xl text-green-400">
+                    <span className="text-xl font-bold text-green-400">
                       {fmtCurrency(currentAsset?.price || 0)}
                     </span>
                   </div>
-                  <div className={`text-sm ${
+                  <div className="flex justify-between text-sm mb-2">
+                    <div className="text-green-400 flex items-center">
+                      <span className="mr-1">_bid:</span> {fmtCurrency(currentAsset?.bid || 0)}
+                    </div>
+                    <div className="text-red-400 flex items-center">
+                      <span className="mr-1">ask:</span> {fmtCurrency(currentAsset?.ask || 0)}
+                    </div>
+                  </div>
+                  <div className={`text-sm flex items-center ${
                     currentAsset?.changePercent >= 0 ? 'text-green-400' : 'text-red-400'
                   }`}>
-                    {currentAsset?.changePercent >= 0 ? '↗' : '↘'} {Math.abs(currentAsset?.changePercent || 0).toFixed(2)}%
+                    {currentAsset?.changePercent >= 0 ? '▲' : '▼'} {Math.abs(currentAsset?.changePercent || 0).toFixed(2)}%
+                    <span className="ml-2 text-gray-400">Spread: {fmtCurrency(currentAsset?.spread || 0)}</span>
                   </div>
                 </div>
 
-                <div className="space-y-2">
-                  <label className="block text-sm font-medium">Quantity</label>
-                  <input
-                    type="number"
-                    value={tradingState.quantity}
-                    onChange={(e) => setTradingState(prev => ({ 
-                      ...prev, 
-                      quantity: e.target.value.replace(/[^0-9]/g, '') 
-                    }))}
-                    className="w-full p-3 bg-gray-700 border border-gray-600 rounded focus:border-blue-500 focus:outline-none"
-                    placeholder="Enter shares"
-                  />
-                </div>
-
-                <div className="grid grid-cols-2 gap-3">
-                  <button
-                    onClick={() => executeTrade('buy')}
-                    className="p-3 bg-green-600 hover:bg-green-700 rounded font-semibold transition-colors"
-                  >
-                    🛒 BUY
-                  </button>
-                  <button
-                    onClick={() => executeTrade('sell')}
-                    className="p-3 bg-red-600 hover:bg-red-700 rounded font-semibold transition-colors"
-                  >
-                    📤 SELL
-                  </button>
-                </div>
-
-                {tradingState.quantity && (
-                  <div className="text-center text-sm text-gray-400">
-                    Estimated Cost: {fmtCurrency((currentAsset?.price || 0) * parseInt(tradingState.quantity) || 0)}
+                <div className="space-y-3">
+                  <div>
+                    <label className="block text-sm font-medium mb-1">Order Type</label>
+                    <div className="grid grid-cols-3 gap-2">
+                      {['market', 'limit', 'stop'].map(type => (
+                        <button
+                          key={type}
+                          onClick={() => setTradingState(prev => ({ ...prev, orderType: type }))}
+                          className={`p-2 rounded-lg text-xs font-medium transition-all ${
+                            tradingState.orderType === type 
+                              ? 'bg-blue-600 text-white' 
+                              : 'bg-gray-700 hover:bg-gray-600 text-gray-300'
+                          }`}
+                        >
+                          {type.charAt(0).toUpperCase() + type.slice(1)}
+                        </button>
+                      ))}
+                    </div>
                   </div>
-                )}
+
+                  {tradingState.orderType === 'limit' && (
+                    <div>
+                      <label className="block text-sm font-medium mb-1">Limit Price</label>
+                      <input
+                        type="number"
+                        value={tradingState.limitPrice}
+                        onChange={(e) => setTradingState(prev => ({ 
+                          ...prev, 
+                          limitPrice: e.target.value 
+                        }))}
+                        className="w-full p-2 bg-gray-700 border border-gray-600 rounded-lg focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
+                        placeholder="Enter limit price"
+                      />
+                    </div>
+                  )}
+
+                  {tradingState.orderType === 'stop' && (
+                    <div>
+                      <label className="block text-sm font-medium mb-1">Stop Price</label>
+                      <input
+                        type="number"
+                        value={tradingState.stopPrice}
+                        onChange={(e) => setTradingState(prev => ({ 
+                          ...prev, 
+                          stopPrice: e.target.value 
+                        }))}
+                        className="w-full p-2 bg-gray-700 border border-gray-600 rounded-lg focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
+                        placeholder="Enter stop price"
+                      />
+                    </div>
+                  )}
+
+                  <div>
+                    <label className="block text-sm font-medium mb-1">Quantity</label>
+                    <input
+                      type="number"
+                      value={tradingState.quantity}
+                      onChange={(e) => setTradingState(prev => ({ 
+                        ...prev, 
+                        quantity: e.target.value.replace(/[^0-9]/g, '') 
+                      }))}
+                      className="w-full p-2 bg-gray-700 border border-gray-600 rounded-lg focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
+                      placeholder="Enter shares"
+                    />
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-3">
+                    <button
+                      onClick={() => executeTrade('buy')}
+                      className="p-3 bg-green-600 hover:bg-green-700 rounded-lg font-semibold transition-colors flex items-center justify-center"
+                    >
+                      <span className="mr-2">🛒</span> BUY
+                    </button>
+                    <button
+                      onClick={() => executeTrade('sell')}
+                      className="p-3 bg-red-600 hover:bg-red-700 rounded-lg font-semibold transition-colors flex items-center justify-center"
+                    >
+                      <span className="mr-2">📤</span> SELL
+                    </button>
+                  </div>
+
+                  {tradingState.quantity && (
+                    <div className="text-center text-sm text-gray-400 bg-gray-700/50 p-2 rounded-lg">
+                      Est. Cost: {fmtCurrency((currentAsset?.price || 0) * parseInt(tradingState.quantity) || 0)}
+                    </div>
+                  )}
+                </div>
               </div>
             </div>
 
             {/* Portfolio Summary */}
-            <div className="bg-gray-800 rounded-lg p-4">
-              <h2 className="text-lg font-semibold mb-4">💼 Portfolio</h2>
-              <div className="space-y-3">
-                <div className="grid grid-cols-2 gap-2">
-                  <div className="bg-gray-700 p-2 rounded text-center">
-                    <div className="text-green-400 font-bold">{fmtCurrency(portfolio.cash)}</div>
+            <div className="bg-gray-800 rounded-xl p-4 shadow-lg">
+              <h2 className="text-lg font-semibold mb-4 flex items-center">
+                <span className="mr-2">💼</span> Portfolio
+              </h2>
+              <div className="space-y-4">
+                <div className="grid grid-cols-2 gap-3">
+                  <div className="bg-gray-700/50 p-3 rounded-lg text-center border border-gray-700">
+                    <div className="text-green-400 font-bold text-lg">{fmtCurrency(portfolio.cash)}</div>
                     <div className="text-xs text-gray-400">Cash</div>
                   </div>
-                  <div className="bg-gray-700 p-2 rounded text-center">
-                    <div className="font-bold">{performanceMetrics.totalTrades}</div>
+                  <div className="bg-gray-700/50 p-3 rounded-lg text-center border border-gray-700">
+                    <div className="font-bold text-lg">{performanceMetrics.totalTrades}</div>
                     <div className="text-xs text-gray-400">Trades</div>
                   </div>
                 </div>
                 
                 {Object.keys(portfolio.positions).length > 0 ? (
-                  <div className="space-y-2">
+                  <div className="space-y-3">
+                    <div className="text-sm font-medium text-gray-400">Positions</div>
                     {Object.entries(portfolio.positions).map(([symbol, position]) => {
                       const asset = marketData[symbol];
                       if (!asset) return null;
@@ -626,22 +844,23 @@ export default function ProfessionalTradingSimulator() {
                       const profitPercent = (profit / position.totalInvested) * 100;
 
                       return (
-                        <div key={symbol} className="bg-gray-700 p-2 rounded">
-                          <div className="flex justify-between items-center">
+                        <div key={symbol} className="bg-gray-700/50 p-3 rounded-lg border border-gray-700">
+                          <div className="flex justify-between items-center mb-1">
                             <span className="font-semibold">{symbol}</span>
-                            <span className={profit >= 0 ? 'text-green-400' : 'text-red-400'}>
+                            <span className={`font-medium ${profit >= 0 ? 'text-green-400' : 'text-red-400'}`}>
                               {fmtCurrency(profit)} ({profitPercent.toFixed(1)}%)
                             </span>
                           </div>
-                          <div className="text-xs text-gray-400">
-                            {position.quantity} shares @ {fmtCurrency(position.averageCost)}
+                          <div className="text-xs text-gray-400 flex justify-between">
+                            <span>{position.quantity} shares</span>
+                            <span>@ {fmtCurrency(position.averageCost)}</span>
                           </div>
                         </div>
                       );
                     })}
                   </div>
                 ) : (
-                  <div className="text-center text-gray-400 py-4">
+                  <div className="text-center text-gray-500 py-4 bg-gray-700/30 rounded-lg">
                     No positions yet
                   </div>
                 )}
@@ -650,20 +869,28 @@ export default function ProfessionalTradingSimulator() {
           </div>
 
           {/* Main Content Area */}
-          <div className="lg:col-span-3 space-y-6">
+          <div className="lg:col-span-2 space-y-6">
             {/* Chart Section */}
-            <div className="bg-gray-800 rounded-lg p-6">
-              <div className="flex justify-between items-center mb-6">
-                <h2 className="text-xl font-bold">
-                  {tradingState.selectedSymbol} - {currentAsset?.name}
-                </h2>
-                <div className="flex gap-2">
+            <div className="bg-gray-800 rounded-xl p-5 shadow-lg">
+              <div className="flex flex-wrap justify-between items-center mb-5 gap-3">
+                <div>
+                  <h2 className="text-xl font-bold">
+                    {tradingState.selectedSymbol} - {currentAsset?.name}
+                  </h2>
+                  <div className="flex items-center text-sm text-gray-400">
+                    <span className="mr-3">Sector: <span className="text-blue-400">{currentAsset?.sector}</span></span>
+                    <span>Volatility: <span className="text-yellow-400">{(currentAsset?.volatility * 100).toFixed(1)}%</span></span>
+                  </div>
+                </div>
+                <div className="flex flex-wrap gap-2">
                   {['1D', '1W', '1M', 'ALL'].map(range => (
                     <button
                       key={range}
                       onClick={() => setTradingState(prev => ({ ...prev, chartRange: range }))}
-                      className={`px-3 py-1 rounded ${
-                        tradingState.chartRange === range ? 'bg-blue-600' : 'bg-gray-700 hover:bg-gray-600'
+                      className={`px-3 py-1.5 rounded-lg text-sm font-medium transition-all ${
+                        tradingState.chartRange === range 
+                          ? 'bg-blue-600 text-white' 
+                          : 'bg-gray-700 hover:bg-gray-600 text-gray-300'
                       }`}
                     >
                       {range}
@@ -674,84 +901,109 @@ export default function ProfessionalTradingSimulator() {
 
               <div className="h-96">
                 <ResponsiveContainer width="100%" height="100%">
-                  <AreaChart data={chartData}>
-                    <CartesianGrid strokeDasharray="3 3" stroke="#444" />
+                  <ComposedChart data={chartData}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
                     <XAxis 
                       dataKey="time"
-                      tickFormatter={(time) => new Date(time).toLocaleTimeString()}
-                      stroke="#888"
+                      tickFormatter={formatTime}
+                      stroke="#9CA3AF"
+                      tick={{ fontSize: 12 }}
                     />
                     <YAxis
-                      stroke="#888"
+                      stroke="#9CA3AF"
                       tickFormatter={(value) => fmtCurrency(value)}
-                      domain={['dataMin - dataMin * 0.01', 'dataMax + dataMax * 0.01']}
+                      domain={['dataMin - dataMin * 0.005', 'dataMax + dataMax * 0.005']}
+                      tick={{ fontSize: 12 }}
                     />
                     <Tooltip content={<MarketTooltip />} />
+                    <ReferenceLine 
+                      y={currentAsset?.bid} 
+                      stroke="#10B981" 
+                      strokeDasharray="3 3" 
+                      strokeWidth={1}
+                    />
+                    <ReferenceLine 
+                      y={currentAsset?.ask} 
+                      stroke="#EF4444" 
+                      strokeDasharray="3 3" 
+                      strokeWidth={1}
+                    />
                     <Area
                       type="monotone"
                       dataKey="value"
                       stroke="#3B82F6"
                       fill="url(#colorGradient)"
                       strokeWidth={2}
+                      isAnimationActive={false}
+                    />
+                    <Line
+                      type="monotone"
+                      dataKey="value"
+                      stroke="#3B82F6"
+                      dot={false}
+                      strokeWidth={2}
+                      isAnimationActive={false}
                     />
                     <defs>
                       <linearGradient id="colorGradient" x1="0" y1="0" x2="0" y2="1">
-                        <stop offset="5%" stopColor="#3B82F6" stopOpacity={0.8}/>
-                        <stop offset="95%" stopColor="#3B82F6" stopOpacity={0.1}/>
+                        <stop offset="5%" stopColor="#3B82F6" stopOpacity={0.3}/>
+                        <stop offset="95%" stopColor="#3B82F6" stopOpacity={0.05}/>
                       </linearGradient>
                     </defs>
-                  </AreaChart>
+                  </ComposedChart>
                 </ResponsiveContainer>
               </div>
 
               {/* Market Statistics */}
-              <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mt-6">
-                <div className="bg-gray-700 p-3 rounded text-center">
-                  <div className="text-lg font-bold">{fmtCurrency(currentAsset?.dailyHigh || 0)}</div>
-                  <div className="text-sm text-gray-400">Daily High</div>
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mt-5">
+                <div className="bg-gray-700/50 p-3 rounded-lg text-center border border-gray-700">
+                  <div className="text-green-400 font-bold">{fmtCurrency(currentAsset?.dailyHigh || 0)}</div>
+                  <div className="text-xs text-gray-400">Daily High</div>
                 </div>
-                <div className="bg-gray-700 p-3 rounded text-center">
-                  <div className="text-lg font-bold">{fmtCurrency(currentAsset?.dailyLow || 0)}</div>
-                  <div className="text-sm text-gray-400">Daily Low</div>
+                <div className="bg-gray-700/50 p-3 rounded-lg text-center border border-gray-700">
+                  <div className="text-red-400 font-bold">{fmtCurrency(currentAsset?.dailyLow || 0)}</div>
+                  <div className="text-xs text-gray-400">Daily Low</div>
                 </div>
-                <div className="bg-gray-700 p-3 rounded text-center">
-                  <div className="text-lg font-bold">{(currentAsset?.volume || 0).toLocaleString()}</div>
-                  <div className="text-sm text-gray-400">Volume</div>
+                <div className="bg-gray-700/50 p-3 rounded-lg text-center border border-gray-700">
+                  <div className="font-bold">{fmtNumber(currentAsset?.volume || 0)}</div>
+                  <div className="text-xs text-gray-400">Volume</div>
                 </div>
-                <div className="bg-gray-700 p-3 rounded text-center">
-                  <div className={`text-lg font-bold ${
+                <div className="bg-gray-700/50 p-3 rounded-lg text-center border border-gray-700">
+                  <div className={`font-bold ${
                     currentAsset?.changePercent >= 0 ? 'text-green-400' : 'text-red-400'
                   }`}>
-                    {fmtPercent((currentAsset?.changePercent || 0) / 100)}
+                    {currentAsset?.changePercent >= 0 ? '▲' : '▼'} {Math.abs(currentAsset?.changePercent || 0).toFixed(2)}%
                   </div>
-                  <div className="text-sm text-gray-400">Change</div>
+                  <div className="text-xs text-gray-400">Change</div>
                 </div>
               </div>
             </div>
 
             {/* Performance Analytics */}
-            <div className="bg-gray-800 rounded-lg p-6">
-              <h2 className="text-xl font-bold mb-4">📊 Performance Analytics</h2>
+            <div className="bg-gray-800 rounded-xl p-5 shadow-lg">
+              <h2 className="text-xl font-bold mb-4 flex items-center">
+                <span className="mr-2">📊</span> Performance Analytics
+              </h2>
               <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-                <div className="bg-gray-700 p-4 rounded text-center">
+                <div className="bg-gray-700/50 p-4 rounded-lg text-center border border-gray-700">
                   <div className="text-2xl font-bold text-green-400">
                     {fmtCurrency(performanceMetrics.totalProfit)}
                   </div>
                   <div className="text-sm text-gray-400">Total Profit</div>
                 </div>
-                <div className="bg-gray-700 p-4 rounded text-center">
+                <div className="bg-gray-700/50 p-4 rounded-lg text-center border border-gray-700">
                   <div className="text-2xl font-bold">
                     {performanceMetrics.totalTrades}
                   </div>
                   <div className="text-sm text-gray-400">Total Trades</div>
                 </div>
-                <div className="bg-gray-700 p-4 rounded text-center">
+                <div className="bg-gray-700/50 p-4 rounded-lg text-center border border-gray-700">
                   <div className="text-2xl font-bold">
                     {fmtPercent(performanceMetrics.winRate)}
                   </div>
                   <div className="text-sm text-gray-400">Win Rate</div>
                 </div>
-                <div className="bg-gray-700 p-4 rounded text-center">
+                <div className="bg-gray-700/50 p-4 rounded-lg text-center border border-gray-700">
                   <div className="text-2xl font-bold">
                     {performanceMetrics.sharpeRatio.toFixed(2)}
                   </div>
@@ -763,47 +1015,69 @@ export default function ProfessionalTradingSimulator() {
             {/* Order Book & Trade History */}
             <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
               {/* Order Book Simulation */}
-              <div className="bg-gray-800 rounded-lg p-4">
-                <h3 className="font-semibold mb-3">📋 Order Book</h3>
+              <div className="bg-gray-800 rounded-xl p-4 shadow-lg">
+                <h3 className="font-semibold mb-3 flex items-center">
+                  <span className="mr-2">📋</span> Order Book
+                </h3>
                 <div className="space-y-1 text-sm">
                   {/* Bid side */}
-                  <div className="text-green-400 text-xs text-center">BIDS</div>
-                  {[0.998, 0.997, 0.996].map(ratio => (
-                    <div key={ratio} className="flex justify-between text-green-400">
-                      <span>{fmtCurrency((currentAsset?.price || 0) * ratio)}</span>
-                      <span>{randomInt(100, 500)}</span>
-                    </div>
-                  ))}
+                  <div className="text-green-400 text-xs text-center font-semibold mb-1">BIDS</div>
+                  <div className="max-h-60 overflow-y-auto">
+                    {orderBook.bids.slice(0, 12).map((bid, index) => (
+                      <div key={index} className="flex justify-between py-1.5 px-2 hover:bg-gray-700/50 rounded">
+                        <span className="text-green-400 font-mono">{fmtCurrency(bid.price)}</span>
+                        <span className="text-gray-300 font-mono">{fmtNumber(bid.size)}</span>
+                      </div>
+                    ))}
+                  </div>
                   
-                  {/* Spread */}
-                  <div className="text-center text-white font-bold my-2">
-                    Spread: {fmtCurrency((currentAsset?.price || 0) * 0.002)}
+                  {/* Current Price */}
+                  <div className="text-center text-white font-bold my-2 py-1 bg-gray-700/50 rounded">
+                    {fmtCurrency(currentAsset?.price || 0)}
+                    <div className="text-xs text-gray-400 mt-1">Spread: {fmtCurrency(currentAsset?.spread || 0)}</div>
                   </div>
                   
                   {/* Ask side */}
-                  <div className="text-red-400 text-xs text-center">ASKS</div>
-                  {[1.002, 1.003, 1.004].map(ratio => (
-                    <div key={ratio} className="flex justify-between text-red-400">
-                      <span>{fmtCurrency((currentAsset?.price || 0) * ratio)}</span>
-                      <span>{randomInt(100, 500)}</span>
-                    </div>
-                  ))}
+                  <div className="text-red-400 text-xs text-center font-semibold mb-1">ASKS</div>
+                  <div className="max-h-60 overflow-y-auto">
+                    {orderBook.asks.slice(0, 12).map((ask, index) => (
+                      <div key={index} className="flex justify-between py-1.5 px-2 hover:bg-gray-700/50 rounded">
+                        <span className="text-red-400 font-mono">{fmtCurrency(ask.price)}</span>
+                        <span className="text-gray-300 font-mono">{fmtNumber(ask.size)}</span>
+                      </div>
+                    ))}
+                  </div>
                 </div>
               </div>
 
               {/* Recent Trades */}
-              <div className="bg-gray-800 rounded-lg p-4">
-                <h3 className="font-semibold mb-3">🔄 Recent Trades</h3>
-                <div className="space-y-1 text-sm max-h-40 overflow-y-auto">
-                  {Array.from({ length: 10 }).map((_, i) => (
-                    <div key={i} className="flex justify-between">
-                      <span className="text-gray-400">{new Date(now() - i * 60000).toLocaleTimeString()}</span>
-                      <span className={Math.random() > 0.5 ? 'text-green-400' : 'text-red-400'}>
-                        {fmtCurrency((currentAsset?.price || 0) * (0.99 + Math.random() * 0.02))}
-                      </span>
-                      <span className="text-gray-400">{randomInt(1, 50)}</span>
+              <div className="bg-gray-800 rounded-xl p-4 shadow-lg">
+                <h3 className="font-semibold mb-3 flex items-center">
+                  <span className="mr-2">🔄</span> Recent Trades
+                </h3>
+                <div className="space-y-1 text-sm max-h-80 overflow-y-auto">
+                  {tradeHistory.length > 0 ? (
+                    tradeHistory.map((trade, index) => (
+                      <div key={index} className="flex justify-between py-2 px-2 hover:bg-gray-700/50 rounded">
+                        <div className="flex items-center">
+                          <span className="text-gray-400 text-xs mr-2">
+                            {new Date(trade.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                          </span>
+                          <span className={`font-medium ${trade.action === 'buy' ? 'text-green-400' : 'text-red-400'}`}>
+                            {trade.action.toUpperCase()}
+                          </span>
+                        </div>
+                        <div className="flex items-center">
+                          <span className="text-gray-300 mr-2">{trade.quantity}</span>
+                          <span className="font-mono">@ {fmtCurrency(trade.price)}</span>
+                        </div>
+                      </div>
+                    ))
+                  ) : (
+                    <div className="text-center text-gray-500 py-8">
+                      No recent trades
                     </div>
-                  ))}
+                  )}
                 </div>
               </div>
             </div>
