@@ -76,17 +76,27 @@ const now = () => Date.now();
 const randomInt = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
 const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
 
-// Realistic price generator using Geometric Brownian Motion with market microstructure
 function generateRealisticPrice(previousPrice, volatility, marketSentiment, eventImpact = 0, timeStep = 1/252/390) {
-  const drift = 0.0001 + (marketSentiment * 0.0003); // Base drift + sentiment influence
-  const volatilityFactor = volatility * Math.sqrt(timeStep); // Adjusted volatility
-  const randomShock = (Math.random() - 0.5) * 2; // Random shock between -1 and 1
+  // More realistic price changes with mean reversion tendency
+  const drift = 0.00005; // Very small positive drift (long-term growth)
+  const meanReversion = 0.1; // Strength of mean reversion to base price
+  const basePriceMultiplier = 0.8 + (Math.random() * 0.4); // Random base price fluctuation
   
-  // Combine all factors
-  const priceChange = drift + volatilityFactor * randomShock + eventImpact;
+  // Calculate distance from "fair value" (base price with some random fluctuation)
+  const fairValue = previousPrice * basePriceMultiplier;
+  const reversionForce = (fairValue - previousPrice) * meanReversion * timeStep;
+  
+  // Random component with volatility
+  const randomShock = (Math.random() - 0.5) * 2 * volatility * Math.sqrt(timeStep);
+  
+  // Combine all factors with appropriate weights
+  const priceChange = drift + reversionForce + randomShock + 
+                     (marketSentiment * 0.0003) + (eventImpact * 0.7);
+  
   const newPrice = previousPrice * Math.exp(priceChange);
   
-  return Math.max(0.01, newPrice); // Prevent negative prices
+  // Ensure price doesn't go to zero and has some minimum value
+  return Math.max(0.01, newPrice);
 }
 
 // Custom tooltip component
@@ -118,18 +128,22 @@ export default function ProfessionalTradingSimulator() {
       const pointsPerDay = 390; // Trading minutes
       const totalPoints = days * pointsPerDay;
       
-      let currentPrice = asset.basePrice;
+      let currentPrice = asset.basePrice * (0.9 + Math.random() * 0.2); // Start with some variation
       for (let i = 0; i < totalPoints; i++) {
-        // Generate realistic historical price
+        // Use the new price generation algorithm for historical data
         const timeStep = 1/252/pointsPerDay;
-        const randomShock = (Math.random() - 0.5) * 2;
-        const priceChange = 0.0001 + asset.volatility * Math.sqrt(timeStep) * randomShock;
+        const randomBaseMultiplier = 0.95 + (Math.random() * 0.1);
+        const fairValue = asset.basePrice * randomBaseMultiplier;
+        const reversionForce = (fairValue - currentPrice) * 0.1 * timeStep;
+        const randomShock = (Math.random() - 0.5) * 2 * asset.volatility * Math.sqrt(timeStep);
+        
+        const priceChange = 0.00005 + reversionForce + randomShock;
         currentPrice = currentPrice * Math.exp(priceChange);
         
         initialHistory.push({
           price: currentPrice,
           volume: randomInt(100000, 500000),
-          timestamp: now() - (totalPoints - i) * 60000 // 1 minute intervals
+          timestamp: now() - (totalPoints - i) * 60000
         });
       }
       
